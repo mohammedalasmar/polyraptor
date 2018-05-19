@@ -1,0 +1,255 @@
+
+#include "RQSegment.h"
+
+namespace inet {
+
+namespace raptorq {
+
+Register_Class(Sack);
+
+bool Sack::empty() const
+{
+    return start_var == 0 && end_var == 0;
+}
+
+bool Sack::contains(const Sack& other) const
+{
+    return seqLE(start_var, other.start_var) && seqLE(other.end_var, end_var);
+}
+
+void Sack::clear()
+{
+    start_var = end_var = 0;
+}
+
+void Sack::setSegment(unsigned int start_par, unsigned int end_par)
+{
+    setStart(start_par);
+    setEnd(end_par);
+}
+
+std::string Sack::str() const
+{
+    std::stringstream out;
+
+    out << "[" << start_var << ".." << end_var << ")";
+    return out.str();
+}
+
+Register_Class(RQSegment);
+
+uint32_t RQSegment::getSegLen()
+{
+    return payloadLength_var + (finBit_var ? 1 : 0) + (synBit_var ? 1 : 0);
+}
+
+void RQSegment::truncateSegment(uint32 firstSeqNo, uint32 endSeqNo)
+{
+    ASSERT(payloadLength_var > 0);
+
+    // must have common part:
+#ifndef NDEBUG
+    if (!(seqLess(sequenceNo_var, endSeqNo) && seqLess(firstSeqNo, sequenceNo_var + payloadLength_var))) {
+        throw cRuntimeError(this, "truncateSegment(%u,%u) called on [%u, %u) segment\n",
+                firstSeqNo, endSeqNo, sequenceNo_var, sequenceNo_var + payloadLength_var);
+    }
+#endif // ifndef NDEBUG
+
+    unsigned int truncleft = 0;
+    unsigned int truncright = 0;
+
+    if (seqLess(sequenceNo_var, firstSeqNo)) {
+        truncleft = firstSeqNo - sequenceNo_var;
+    }
+
+    if (seqGreater(sequenceNo_var + payloadLength_var, endSeqNo)) {
+        truncright = sequenceNo_var + payloadLength_var - endSeqNo;
+    }
+
+    truncateData(truncleft, truncright);
+}
+
+unsigned short RQSegment::getHeaderOptionArrayLength()
+{
+    unsigned short usedLength = 0;
+
+    for (uint i = 0; i < getHeaderOptionArraySize(); i++)
+        usedLength += getHeaderOption(i)->getLength();
+
+    return usedLength;
+}
+
+RQSegment& RQSegment::operator=(const RQSegment& other)
+{
+    if (this == &other)
+        return *this;
+    clean();
+    RQSegment_Base::operator=(other);
+    copy(other);
+    return *this;
+}
+
+void RQSegment::copy(const RQSegment& other)
+{
+    for (const auto & elem : other.payloadList)
+        addPayloadMessage(elem.msg->dup(), elem.endSequenceNo);
+    for (const auto opt: other.headerOptionList)
+        addHeaderOption(opt->dup());
+}
+
+RQSegment::~RQSegment()
+{
+    clean();
+}
+
+void RQSegment::clean()
+{
+//    dropHeaderOptions();
+
+    while (!payloadList.empty()) {
+        cPacket *msg = payloadList.front().msg;
+        payloadList.pop_front();
+        dropAndDelete(msg);
+    }
+}
+
+void RQSegment::truncateData(unsigned int truncleft, unsigned int truncright)
+{
+    ASSERT(payloadLength_var >= truncleft + truncright);
+
+    if (0 != byteArray_var.getDataArraySize())
+        byteArray_var.truncateData(truncleft, truncright);
+
+    while (!payloadList.empty() && (payloadList.front().endSequenceNo - sequenceNo_var) <= truncleft) {
+        cPacket *msg = payloadList.front().msg;
+        payloadList.pop_front();
+        dropAndDelete(msg);
+    }
+
+    sequenceNo_var += truncleft;
+    payloadLength_var -= truncleft + truncright;
+
+    // truncate payload data correctly
+    while (!payloadList.empty() && (payloadList.back().endSequenceNo - sequenceNo_var) > payloadLength_var) {
+        cPacket *msg = payloadList.back().msg;
+        payloadList.pop_back();
+        dropAndDelete(msg);
+    }
+}
+
+void RQSegment::parsimPack(cCommBuffer *b) const
+{
+    RQSegment_Base::parsimPack(b);
+    b->pack((int)headerOptionList.size());
+    for (const auto opt: headerOptionList) {
+        b->packObject(opt);
+    }
+    b->pack((int)payloadList.size());
+    for (PayloadList::const_iterator it = payloadList.begin(); it != payloadList.end(); it++) {
+        b->pack(it->endSequenceNo);
+        b->packObject(it->msg);
+    }
+}
+
+void RQSegment::parsimUnpack(cCommBuffer *b)
+{
+    RQSegment_Base::parsimUnpack(b);
+    int i, n;
+    b->unpack(n);
+    for (i = 0; i < n; i++) {
+        RQOption *opt = check_and_cast<RQOption*>(b->unpackObject());
+        headerOptionList.push_back(opt);
+    }
+    b->unpack(n);
+    for (i = 0; i < n; i++) {
+        RQPayloadMessage payload;
+        b->unpack(payload.endSequenceNo);
+        payload.msg = check_and_cast<cPacket*>(b->unpackObject());
+        payloadList.push_back(payload);
+    }
+}
+
+void RQSegment::setPayloadArraySize(unsigned int size)
+{
+    throw cRuntimeError(this, "setPayloadArraySize() not supported, use addPayloadMessage()");
+}
+
+unsigned int RQSegment::getPayloadArraySize() const
+{
+    return payloadList.size();
+}
+
+RQPayloadMessage& RQSegment::getPayload(unsigned int k)
+{
+    auto i = payloadList.begin();
+    while (k > 0 && i != payloadList.end())
+        (++i, --k);
+    if (i == payloadList.end())
+        throw cRuntimeError("Model error at getPayload(): index out of range");
+    return *i;
+}
+
+void RQSegment::setPayload(unsigned int k, const RQPayloadMessage& payload_var)
+{
+    throw cRuntimeError(this, "setPayload() not supported, use addPayloadMessage()");
+}
+
+void RQSegment::addPayloadMessage(cPacket *msg, uint32 endSequenceNo)
+{
+    take(msg);
+
+    RQPayloadMessage payload;
+    payload.endSequenceNo = endSequenceNo;
+    payload.msg = msg;
+    payloadList.push_back(payload);
+}
+
+cPacket *RQSegment::removeFirstPayloadMessage(uint32& endSequenceNo)
+{
+    if (payloadList.empty())
+        return nullptr;
+
+    cPacket *msg = payloadList.front().msg;
+    endSequenceNo = payloadList.front().endSequenceNo;
+    payloadList.pop_front();
+    drop(msg);
+    return msg;
+}
+
+void RQSegment::addHeaderOption(RQOption *option)
+{
+    headerOptionList.push_back(option);
+}
+
+void RQSegment::setHeaderOptionArraySize(unsigned int size)
+{
+    throw cRuntimeError(this, "setHeaderOptionArraySize() not supported, use addHeaderOption()");
+}
+
+unsigned int RQSegment::getHeaderOptionArraySize() const
+{
+    return headerOptionList.size();
+}
+
+RQOptionPtr& RQSegment::getHeaderOption(unsigned int k)
+{
+    return headerOptionList.at(k);
+}
+
+void RQSegment::setHeaderOption(unsigned int k, const RQOptionPtr& headerOption)
+{
+    throw cRuntimeError(this, "setHeaderOption() not supported, use addHeaderOption()");
+}
+
+void RQSegment::dropHeaderOptions()
+{
+    for (auto opt : headerOptionList)
+        delete opt;
+    headerOptionList.clear();
+}
+
+
+} // namespace raptorq
+
+} // namespace inet
+
