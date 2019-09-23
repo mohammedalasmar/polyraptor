@@ -1,5 +1,5 @@
 # polyraptor
-Polyraptor implementation in OmNet++.
+Polyraptor implementation in OMNeT++.
 
 Polyraptor is a novel data transport protocol, along with flow and congestion control algorithms, that uses RaptorQ codes and
 is tailored for one-to-many and many-to-one data transfer patterns in modern data centres. 
